@@ -23,32 +23,53 @@
     <button id="tie">并网</button>
     <button id="off">离网</button>
     <button id="reset">复位跳闸</button>
+    <p id="result"></p>
   </section>
   <section>
     <h2>BMS</h2>
     <pre id="bms"></pre>
   </section>
   <script>
+    // 400 是参数问题（修正入参后重试）；409 是业务拒绝（状态不允许，先处理现场）；
+    // 404 是寻址问题。三类错误页面给不同提示，不再只有一句 JSON。
     async function post(path, body) {
       const response = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify(body || {})});
-      return response.json();
+      const payload = await response.json();
+      return {ok: response.ok, status: response.status, payload};
     }
     async function load() {
-      const pcs = await (await fetch("/api/pcs")).json();
+      const response = await fetch("/api/view/pcs");
+      const payload = await response.json();
+      if (!response.ok) {
+        document.getElementById("result").textContent = `读取失败：${payload.message || response.status}`;
+        return;
+      }
+      const pcs = payload.pcs;
       const rows = [
         ["运行模式", pcs.state], ["迁移代际", pcs.generation], ["降额系数", pcs.derate_ratio],
         ["输出(kW)", pcs.output_kw], ["上网(kW)", pcs.delivered_kw], ["无功(kVar)", pcs.reactive_kvar],
         ["效率", pcs.efficient_at], ["爬坡(kW)", pcs.ramp_kw], ["跳闸", pcs.tripped],
+        ["快照版本", payload.revision],
       ];
       document.getElementById("pcs").innerHTML = rows
         .map(([key, value]) => `<tr><th>${key}</th><td>${value}</td></tr>`).join("");
-      const bms = await (await fetch("/api/bms")).json();
-      document.getElementById("bms").textContent = JSON.stringify(bms, null, 2);
+      document.getElementById("bms").textContent = JSON.stringify(payload.bms, null, 2);
+      document.getElementById("result").textContent = "";
     }
-    document.getElementById("tie").onclick = async () => { await post("/api/transfer", {power_kw: 120}); load(); };
-    document.getElementById("off").onclick = async () => { await post("/api/off-grid"); load(); };
-    document.getElementById("reset").onclick = async () => { await post("/api/fire/release"); load(); };
+    function showOutcome(label, outcome) {
+      if (outcome.ok) {
+        document.getElementById("result").textContent = `${label}：已接受（快照版本 ${outcome.payload.revision}）`;
+      } else {
+        const prefix = {400: "参数被拒", 404: "寻址失败", 409: "业务拒绝"}[outcome.status] || "请求失败";
+        const detail = outcome.payload.field ? `（字段 ${outcome.payload.field}）` : "";
+        document.getElementById("result").textContent = `${label}：${prefix} ${detail} ${outcome.payload.message || ""}`;
+      }
+      load();
+    }
+    document.getElementById("tie").onclick = async () => showOutcome("并网", await post("/api/transfer", {power_kw: 120}));
+    document.getElementById("off").onclick = async () => showOutcome("离网", await post("/api/off-grid"));
+    document.getElementById("reset").onclick = async () => showOutcome("复位", await post("/api/fire/release"));
     load();
     setInterval(load, 5000);
   </script>

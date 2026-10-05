@@ -28,6 +28,7 @@ HOOK_NAMES = {
     "__post_init__",
     "__enter__",
     "__exit__",
+    "__call__",
     "__repr__",
     "__eq__",
     "__hash__",
@@ -40,6 +41,17 @@ HOOK_NAMES = {
     "log_message",
     "main",
 }
+
+# 带这些装饰器的方法由路由框架反射收集，不需要显式引用，不算死符号。
+_HOOK_DECORATORS = {"Endpoint", "property", "classmethod", "staticmethod"}
+
+
+def _decorated_as_hook(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for decorator in node.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(target, ast.Name) and target.id in _HOOK_DECORATORS:
+            return True
+    return False
 
 
 def _module_name(path: str, root: str) -> str:
@@ -81,6 +93,7 @@ def _collect_definitions(tree: ast.AST, module: str) -> list[dict]:
                             "module": module,
                             "line": item.lineno,
                             "kind": "method",
+                            "hook": _decorated_as_hook(item),
                         }
                     )
     return found
@@ -144,6 +157,7 @@ def analyze(root: str) -> dict:
         for item in definitions
         if usages.get(item["name"], 0) == 0
         and item["name"] not in HOOK_NAMES
+        and not item.get("hook")
         and not item["module"].endswith("__main__")
     ]
 

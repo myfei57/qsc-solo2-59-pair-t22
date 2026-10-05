@@ -25,16 +25,19 @@
     <tbody id="audit"></tbody>
   </table>
   <script>
+    // 告警表与审计表来自 /api/view/alarms 同一个响应，两表在同一 revision 下
+    // 渲染；告警路由依据的簇状态不会比审计更新或更旧。
     async function load() {
-      const alerts = await (await fetch("/api/alerts")).json();
-      document.getElementById("alerts").innerHTML = alerts.alerts.length
-        ? alerts.alerts.map((item) =>
+      const response = await fetch("/api/view/alarms?limit=30");
+      const payload = await response.json();
+      if (!response.ok) { return; }
+      document.getElementById("alerts").innerHTML = payload.alerts.length
+        ? payload.alerts.map((item) =>
             `<tr><td>${item.label}</td><td>${item.zone}</td><td>${item.code}</td>` +
             `<td class="${item.severity}">${item.severity}</td>` +
             `<td>${JSON.stringify(item.detail)}</td></tr>`).join("")
-        : `<tr><td colspan="5">当前无告警</td></tr>`;
-      const audit = await (await fetch("/api/audit?limit=30")).json();
-      document.getElementById("audit").innerHTML = audit.entries
+        : `<tr><td colspan="5">当前无告警（快照版本 ${payload.revision}）</td></tr>`;
+      document.getElementById("audit").innerHTML = payload.audit.entries
         .map((entry) =>
           `<tr><td>${entry.ts}</td><td>${entry.component}</td><td>${entry.action}</td>` +
           `<td class="${entry.severity}">${entry.severity}</td><td>${entry.payload.op_id || ""}</td></tr>`).join("");

@@ -46,6 +46,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     base_url = server.start()
     payload: dict = {
         "listening": base_url,
+        "self_check": server.startup_report(),
         "routes": server.api.routes(),
         "pages": server.pages.index(),
         "pages_ready": server.pages.exists(),

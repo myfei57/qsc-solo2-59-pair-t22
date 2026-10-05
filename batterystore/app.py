@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
@@ -113,10 +114,51 @@ class Platform:
         self._drills = 0
         self._last_audit_ts = 0.0
         self._running = False
+        # 单调数据版本：每次成功提交的写动作 +1。页面视图与单接口读数在同一把
+        # 锁、同一个 revision 下组装，前端拿两个响应的 revision 一比就知道是否
+        # 同一份快照；revision 也随状态落盘，重启后不回退。
+        self._revision = 0
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
         self.bms.calibration.record(self.config.soc.initial_soc_pct, self.clock.now(), "startup")
+
+    @property
+    def revision(self) -> int:
+        """当前数据版本（单调递增，每次成功写动作 +1）。"""
+
+        return self._revision
+
+    @contextmanager
+    def read_lock(self):
+        """一致性读门：在同一把平台锁内组装整份响应。
+
+        页面一次刷新要同时取簇表和总状态、接口也可能并发调用；只要读数在
+        本上下文里完成，期间任何写动作（控制周期、POST 动作）都无法插入，
+        因此"页面与接口"、"接口与接口"不会在两次调用间看到互相撕裂的状态。
+        返回的上下文对象带出当前 revision，调用方在锁内读一次即可盖戳。
+        """
+
+        self._lock.acquire()
+        try:
+            yield self
+        finally:
+            self._lock.release()
+
+    @contextmanager
+    def commit(self):
+        """写动作提交门：进入即取锁，块正常退出时 revision +1 并落盘计数。"""
+
+        self._lock.acquire()
+        try:
+            yield self
+        except BaseException:
+            raise
+        else:
+            self._revision += 1
+            self._persist()
+        finally:
+            self._lock.release()
 
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
@@ -148,6 +190,7 @@ class Platform:
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
             self._drills = int(state.get("drills", 0))
+            self._revision = int(state.get("revision", 0))
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -158,6 +201,7 @@ class Platform:
                 "operations": self._operations,
                 "cycles": self._cycles,
                 "drills": self._drills,
+                "revision": self._revision,
                 "station": self.station,
             },
         )
@@ -222,7 +266,6 @@ class Platform:
             )
         )
         self._operations += 1
-        self._persist()
         return summary
 
     def note_error(self, error: StoreError) -> dict:
@@ -244,7 +287,7 @@ class Platform:
     def start(self) -> dict:
         """启动平台：核对拓扑与命名空间。"""
 
-        with self._lock:
+        with self.commit():
             self._running = True
             self.bms.online()
             ready = {name: True for name in self.topology.order()}
@@ -262,7 +305,7 @@ class Platform:
     def stop(self) -> dict:
         """停运平台。"""
 
-        with self._lock:
+        with self.commit():
             self._running = False
             self.bms.offline()
             if self.pcs.state_machine.state in ("grid_tie", "off_grid"):
@@ -278,7 +321,7 @@ class Platform:
     def reset_state(self) -> dict:
         """清掉落盘的平台计数。"""
 
-        with self._lock:
+        with self.commit():
             previous = {"operations": self._operations, "cycles": self._cycles, "drills": self._drills}
             self._operations = 0
             self._cycles = 0
@@ -289,7 +332,7 @@ class Platform:
     def transfer_grid_tie(self, power_kw: float = 120.0, frequency_hz: float = 50.0, dt: float = 1.0) -> dict:
         """并网编排：BMS 就绪 → PCS 切换 → 并网校验 → 功率输出。"""
 
-        with self._lock:
+        with self.commit():
             op_id = self.ids.next()
             rack = self._rack(DEFAULT_RACK)
             report = transfer_to_grid(
@@ -309,7 +352,7 @@ class Platform:
     def transfer_off_grid(self) -> dict:
         """离网编排：先回到离网态，再清零功率。"""
 
-        with self._lock:
+        with self.commit():
             op_id = self.ids.next()
             steps: list[dict] = []
             violations: list[str] = []
@@ -323,7 +366,7 @@ class Platform:
     def discharge(self, power_kw: float = 200.0, dt: float = 60.0) -> dict:
         """放电编排：并网限额钳位 → 爬坡 → 电量累计 → 配额记账。"""
 
-        with self._lock:
+        with self.commit():
             op_id = self.ids.next()
             rack = self._rack(DEFAULT_RACK)
             report = discharge_rack(
@@ -343,7 +386,7 @@ class Platform:
     def charge(self, rack_id: str | None = None, steps: int = 3, dt: float = 60.0) -> dict:
         """充电编排：均衡核对 → 温控降额 → 电压核对 → 电流阶梯 → 配额记账。"""
 
-        with self._lock:
+        with self.commit():
             op_id = self.ids.next()
             rack = self._rack(rack_id)
             report = charge_rack(
@@ -366,7 +409,7 @@ class Platform:
     def balance(self, rack_id: str | None = None, dt: float = 2.0, max_steps: int = 400) -> dict:
         """跑一次均衡直到压差回到目标带内或超时中止。"""
 
-        with self._lock:
+        with self.commit():
             op_id = self.ids.next()
             rack = self._rack(rack_id)
             started = self.balancer.start(rack.cells())
@@ -395,7 +438,7 @@ class Platform:
     def sample_temperature(self, rack_id: str | None = None, temperature_c: float = 30.0, dt: float = 5.0) -> dict:
         """温控降额编排：温度采集 → 基线读取 → 降额 → 充电限制。"""
 
-        with self._lock:
+        with self.commit():
             op_id = self.ids.next()
             rack = self._rack(rack_id)
             rack.apply_temperature(temperature_c)
@@ -424,7 +467,7 @@ class Platform:
     def replace_pack_rating(self, pack_index: int = 0, rating_v: float = 3.35, rack_id: str | None = None) -> dict:
         """更换整包电芯并立即刷新降额基线。"""
 
-        with self._lock:
+        with self.commit():
             op_id = self.ids.next()
             rack = self._rack(rack_id)
             change = rack.replace_pack_rating(pack_index, rating_v)
@@ -440,7 +483,7 @@ class Platform:
     def calibrate_soc(self, soc_pct: float, source: str = "manual") -> dict:
         """登记一次 SOC 校准并按新基准重估。"""
 
-        with self._lock:
+        with self.commit():
             op_id = self.ids.next()
             record = self.bms.calibrate(soc_pct, source)
             self.soc.reset()
@@ -459,7 +502,7 @@ class Platform:
     def report_fault(self, rack_id: str | None = None, code: str = "bms_fault") -> dict:
         """登记一次故障上报（可并发调用）。"""
 
-        with self._lock:
+        with self.commit():
             result = self.bms.report_fault(rack_id or DEFAULT_RACK, code)
             self._faults_reported += 1
             self.bus.publish(
@@ -477,7 +520,7 @@ class Platform:
     def clear_fault(self, rack_id: str | None = None) -> dict:
         """清除某簇故障计数与闩锁。"""
 
-        with self._lock:
+        with self.commit():
             key = rack_id or DEFAULT_RACK
             cleared = self.bms.clear_fault(key)
             self.bus.publish(Event.of("bms", "bms", "fault_clear", station=self.station, severity="notice", rack_id=key))
@@ -492,7 +535,7 @@ class Platform:
     ) -> dict:
         """消防联动编排：探测 → 开阀 → 确认 → 断 PCS → 审计。"""
 
-        with self._lock:
+        with self.commit():
             op_id = self.ids.next()
             report = suppress(
                 self.fire,
@@ -507,13 +550,12 @@ class Platform:
             summary = self._record_operation(op_id, "fire_suppression", report)
             if report["ok"]:
                 self._drills += 1
-                self._persist()
             return {**report, **summary}
 
     def release_fire(self) -> dict:
         """复位消防联动与 PCS 跳闸。"""
 
-        with self._lock:
+        with self.commit():
             released = self.fire.reset()
             reset = self.pcs.reset_trip()
             self.bus.publish(Event.of("fire", "fire", "released", station=self.station, severity="notice"))
@@ -522,13 +564,13 @@ class Platform:
     def monitor_frequency(self, frequency_hz: float = 50.0) -> dict:
         """记一次并网点频率采样。"""
 
-        with self._lock:
+        with self.commit():
             return self.grid.monitor_frequency(frequency_hz, self.clock.now())
 
     def set_soc(self, rack_id: str | None = None, soc_pct: float = 50.0) -> dict:
         """直接写入某簇 SOC（现场标定用）。"""
 
-        with self._lock:
+        with self.commit():
             rack = self._rack(rack_id)
             bounded = self.config.rack.clamp_soc(soc_pct)
             previous = rack.set_soc(bounded)
@@ -538,7 +580,7 @@ class Platform:
     def disturb_cell(self, rack_id: str | None = None, cell_index: int = 0, delta_v: float = 0.03) -> dict:
         """人为制造单体偏差，用于复现压差越限与均衡场景。"""
 
-        with self._lock:
+        with self.commit():
             rack = self._rack(rack_id)
             cells = rack.cells()
             if not 0 <= cell_index < len(cells):
@@ -556,7 +598,7 @@ class Platform:
     def cycle(self, dt: float = 5.0) -> dict:
         """推进一个控制周期。"""
 
-        with self._lock:
+        with self.commit():
             self._cycles += 1
             now = self.clock.now()
             temperatures: dict[str, float] = {}
@@ -577,7 +619,6 @@ class Platform:
                 rack.set_soc(estimate.soc_pct)
             rolled = self.quota.roll(now)
             self.grid.monitor_frequency(50.0, now)
-            self._persist()
             return {
                 "cycle": self._cycles,
                 "temperatures": temperatures,

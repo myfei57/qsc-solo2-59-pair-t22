@@ -26,6 +26,7 @@ RUNTIME_HOOKS = {
     "__post_init__",
     "__enter__",
     "__exit__",
+    "__call__",
     "__repr__",
     "__eq__",
     "__hash__",
@@ -39,6 +40,17 @@ RUNTIME_HOOKS = {
 
 # 构建残留标记由片段拼出，避免把该类字样写进仓库本身。
 FORBIDDEN_TOKEN = "".join(("ben", "zhi"))
+
+# 带这些装饰器的方法由框架按约定反射收集（路由登记、属性描述符），不算死符号。
+_HOOK_DECORATORS = {"Endpoint", "property", "classmethod", "staticmethod"}
+
+
+def _decorated_as_hook(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for decorator in node.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(target, ast.Name) and target.id in _HOOK_DECORATORS:
+            return True
+    return False
 
 
 def _module_name(path: Path) -> str:
@@ -62,12 +74,19 @@ def _definitions(tree: ast.AST, module: str) -> list[dict]:
     found: list[dict] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            found.append({"name": node.name, "module": module, "line": node.lineno})
+            found.append({"name": node.name, "module": module, "line": node.lineno, "hook": False})
         elif isinstance(node, ast.ClassDef):
-            found.append({"name": node.name, "module": module, "line": node.lineno})
+            found.append({"name": node.name, "module": module, "line": node.lineno, "hook": False})
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    found.append({"name": item.name, "module": module, "line": item.lineno})
+                    found.append(
+                        {
+                            "name": item.name,
+                            "module": module,
+                            "line": item.lineno,
+                            "hook": _decorated_as_hook(item),
+                        }
+                    )
     return found
 
 
@@ -131,6 +150,7 @@ def test_no_unreferenced_symbols_in_package():
         for item in definitions
         if usages.get(item["name"], 0) == 0
         and item["name"] not in RUNTIME_HOOKS
+        and not item["hook"]
         and not item["module"].endswith("__main__")
     ]
     assert orphans == [], f"存在生成了但没人调用的符号: {orphans}"

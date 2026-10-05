@@ -18,10 +18,19 @@
   <h2>配额与结算</h2>
   <table><tbody id="quota"></tbody></table>
   <h2>趋势</h2>
-  <pre id="trend"></pre>
+  <pre id="trend">读取中…</pre>
   <script>
+    // 并网点、配额、趋势三块只来自 /api/view/power 一个响应，服务端在同一
+    // revision 快照下组装，页面上三块之间、以及与 /api/grid、/api/quota
+    // 的直接读数之间用 revision 对得齐。
     async function load() {
-      const grid = await (await fetch("/api/grid")).json();
+      const response = await fetch("/api/view/power?signal=rk-01.voltage");
+      const payload = await response.json();
+      if (!response.ok) {
+        document.getElementById("trend").textContent = `读取失败：${payload.message || response.status}`;
+        return;
+      }
+      const grid = payload.grid;
       const flow = grid.flow;
       document.getElementById("grid").innerHTML = [
         ["上网限额(kW)", grid.limit.export_limit_kw],
@@ -32,7 +41,7 @@
         ["频率", grid.frequency.last ? grid.frequency.last.frequency_hz : "无"],
       ].map(([key, value]) => `<tr><th>${key}</th><td>${value}</td></tr>`).join("");
 
-      const quota = await (await fetch("/api/quota")).json();
+      const quota = payload.quota;
       document.getElementById("quota").innerHTML = [
         ["周期", quota.period],
         ["滚动次数", quota.rolls],
@@ -43,9 +52,9 @@
         ["本周期收益", quota.settlement.margin],
       ].map(([key, value]) => `<tr><th>${key}</th><td>${value}</td></tr>`).join("");
 
-      const trend = await (await fetch("/api/trend?signal=rk-01.voltage")).json();
+      const trend = payload.trend;
       document.getElementById("trend").textContent =
-        `信号 ${trend.signal}｜周期 ${trend.period_s}s｜均值 ${trend.mean}\n` +
+        `信号 ${trend.signal}｜周期 ${trend.period_s}s｜均值 ${trend.mean}｜快照版本 ${payload.revision}\n` +
         trend.samples.map((point) => `${point.ts}  ${point.value}`).join("\n");
     }
     load();

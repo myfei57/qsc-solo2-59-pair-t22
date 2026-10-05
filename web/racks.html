@@ -22,9 +22,15 @@
     <tbody id="rows"></tbody>
   </table>
   <script>
+    // 整页只有 /api/view/racks 一个数据源：簇表与总状态在服务端同一个 revision
+    // 快照下取齐，页面上每块内容、以及它与直接调 /api/racks 之间都不会对不上。
     async function load() {
-      const response = await fetch("/api/racks");
+      const response = await fetch("/api/view/racks");
       const payload = await response.json();
+      if (!response.ok) {
+        document.getElementById("summary").textContent = `读取失败：${payload.message || response.status}`;
+        return;
+      }
       const rows = document.getElementById("rows");
       rows.innerHTML = "";
       for (const rack of payload.racks) {
@@ -35,9 +41,9 @@
           `<td>${metrics.max_temperature_c}</td><td>${rack.rating_epoch}</td>`;
         rows.appendChild(tr);
       }
-      const status = await (await fetch("/api/status")).json();
+      const status = payload.status;
       document.getElementById("summary").textContent =
-        `站点 ${status.station}｜运行 ${status.running}｜周期 ${status.cycles}｜操作 ${status.operations}`;
+        `站点 ${status.station}｜运行 ${status.running}｜周期 ${status.cycles}｜操作 ${status.operations}｜快照版本 ${payload.revision}`;
     }
     load();
     setInterval(load, 5000);
