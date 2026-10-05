@@ -143,11 +143,14 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 
 def _cmd_status(args: argparse.Namespace) -> int:
     platform = _build(args)
-    payload = platform.status()
-    payload["topology"] = platform.topology_summary()
-    payload["capacity"] = platform.capacity().as_dict()
-    payload["quota"] = platform.quota_snapshot()
+    # 与页面、接口同源：直接取只读视图投影，不另拼一份状态口径。
+    view = platform.read_view()
+    payload = view["status"]
+    payload["topology"] = view["topology"]
+    payload["capacity"] = view["capacity"]
+    payload["quota"] = view["quota"]
     payload["trend"] = platform.trend_snapshot()
+    payload["revision"] = view["revision"]
     _dump(payload)
     return 0
 

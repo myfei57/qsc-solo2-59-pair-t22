@@ -10,6 +10,8 @@
     th { background: #eef3f9; }
     .warn { color: #b45309; }
     .alarm { color: #b91c1c; font-weight: 600; }
+    .error { color: #b91c1c; }
+    .rev { color: #5b6775; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -21,13 +23,17 @@
     </thead>
     <tbody id="rows"></tbody>
   </table>
+  <p class="rev" id="revision"></p>
+  <script src="console.js"></script>
   <script>
-    async function load() {
-      const response = await fetch("/api/racks");
-      const payload = await response.json();
+    // 整页只消费 /api/view 一份快照，表头汇总与各行数据必然来自同一 revision。
+    ConsoleData.startPolling((view) => {
+      const status = view.status;
+      document.getElementById("summary").textContent =
+        `站点 ${status.station}｜运行 ${status.running}｜周期 ${status.cycles}｜操作 ${status.operations}`;
       const rows = document.getElementById("rows");
       rows.innerHTML = "";
-      for (const rack of payload.racks) {
+      for (const rack of view.racks) {
         const metrics = rack.metrics;
         const tr = document.createElement("tr");
         tr.innerHTML = `<td>${rack.rack_id}</td><td>${rack.zone}</td><td>${rack.soc_pct}</td>` +
@@ -35,12 +41,8 @@
           `<td>${metrics.max_temperature_c}</td><td>${rack.rating_epoch}</td>`;
         rows.appendChild(tr);
       }
-      const status = await (await fetch("/api/status")).json();
-      document.getElementById("summary").textContent =
-        `站点 ${status.station}｜运行 ${status.running}｜周期 ${status.cycles}｜操作 ${status.operations}`;
-    }
-    load();
-    setInterval(load, 5000);
+      document.getElementById("revision").textContent = "数据版本 " + view.revision;
+    });
   </script>
 </body>
 </html>

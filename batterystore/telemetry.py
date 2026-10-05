@@ -89,6 +89,12 @@ class TrendBuffer:
             filled.append(current)
         return filled
 
+    def signals(self) -> set[str]:
+        """返回当前已有样本的全部信号名，供参数校验做资源存在性核对。"""
+
+        with self._lock:
+            return set(self._series)
+
     def snapshot(self, limit: int = 8) -> dict:
         """汇总各信号的最新样本，供状态快照读取。"""
 

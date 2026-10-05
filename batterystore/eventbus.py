@@ -29,11 +29,13 @@ class Event:
         return cls(topic=topic, component=component, action=action, payload=dict(payload))
 
     def as_dict(self) -> dict:
+        # payload 给副本：历史事件会被读视图按代际缓存，不能把总线里的可变
+        # dict 直接暴露出去，否则发布方事后修改会篡改旧快照。
         return {
             "topic": self.topic,
             "component": self.component,
             "action": self.action,
-            "payload": self.payload,
+            "payload": dict(self.payload),
         }
 
 

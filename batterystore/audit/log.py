@@ -35,6 +35,12 @@ class AuditLog:
     def journal(self) -> JsonlJournal:
         return self._journal
 
+    @property
+    def memory_limit(self) -> int:
+        """内存保留的流水条数上限。"""
+
+        return self._memory_limit
+
     def _on_event(self, event: Event) -> None:
         severity = "notice"
         payload = dict(event.payload)

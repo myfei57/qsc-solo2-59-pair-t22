@@ -57,8 +57,11 @@ def test_runtime_counters_survive_rebuild(tmp_path):
 def test_store_summary_and_config_export(platform):
     platform.start()
     platform.monitor_frequency(49.98)
-    assert platform.config_export()["station"]["storage_root"]
-    assert platform.namespaces_describe()
-    assert platform.topology_summary()["zone_racks"]
-    assert platform.rack_snapshot("rk-01")["rack_id"] == "rk-01"
-    assert len(platform.rack_snapshots()) == 2
+    view = platform.read_view()
+    assert view["config"]["station"]["storage_root"]
+    assert view["namespaces"]
+    assert view["topology"]["zone_racks"]
+    rk01 = next(rack for rack in view["racks"] if rack["rack_id"] == "rk-01")
+    assert rk01["rack_id"] == "rk-01"
+    assert len(view["racks"]) == 2
+    assert view["revision"] == platform.revision()

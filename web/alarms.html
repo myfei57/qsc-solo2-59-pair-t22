@@ -10,6 +10,7 @@
     th { background: #eef3f9; }
     .alarm { color: #b91c1c; font-weight: 600; }
     .warning { color: #b45309; }
+    .rev { color: #5b6775; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -24,23 +25,25 @@
     <thead><tr><th>时间</th><th>组件</th><th>动作</th><th>级别</th><th>操作</th></tr></thead>
     <tbody id="audit"></tbody>
   </table>
+  <p class="rev" id="revision"></p>
+  <script src="console.js"></script>
   <script>
-    async function load() {
-      const alerts = await (await fetch("/api/alerts")).json();
-      document.getElementById("alerts").innerHTML = alerts.alerts.length
-        ? alerts.alerts.map((item) =>
+    // 告警表与审计表同出一代 view，不会出现"告警还在、审计已经翻篇"的错位。
+    ConsoleData.startPolling((view) => {
+      document.getElementById("alerts").innerHTML = view.alerts.length
+        ? view.alerts.map((item) =>
             `<tr><td>${item.label}</td><td>${item.zone}</td><td>${item.code}</td>` +
             `<td class="${item.severity}">${item.severity}</td>` +
             `<td>${JSON.stringify(item.detail)}</td></tr>`).join("")
         : `<tr><td colspan="5">当前无告警</td></tr>`;
-      const audit = await (await fetch("/api/audit?limit=30")).json();
-      document.getElementById("audit").innerHTML = audit.entries
+      const entries = view.audit_entries.slice(-30).reverse();
+      document.getElementById("audit").innerHTML = entries
         .map((entry) =>
           `<tr><td>${entry.ts}</td><td>${entry.component}</td><td>${entry.action}</td>` +
-          `<td class="${entry.severity}">${entry.severity}</td><td>${entry.payload.op_id || ""}</td></tr>`).join("");
-    }
-    load();
-    setInterval(load, 5000);
+          `<td class="${entry.severity}">${entry.severity}</td>` +
+          `<td>${entry.payload.op_id || ""}</td></tr>`).join("");
+      document.getElementById("revision").textContent = "数据版本 " + view.revision;
+    });
   </script>
 </body>
 </html>

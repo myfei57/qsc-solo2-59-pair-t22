@@ -8,18 +8,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
-
-Handler = Callable[[dict, dict], dict]
+from typing import Any
 
 
 @dataclass(frozen=True)
 class Route:
-    """一条路由。"""
+    """一条路由。``handler`` 可以是任意对象，由路由持有方按约定分发。"""
 
     method: str
     pattern: str
-    handler: Handler
+    handler: Any
 
     def as_dict(self) -> dict:
         return {"method": self.method, "path": self.pattern}

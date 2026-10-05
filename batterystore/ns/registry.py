@@ -47,6 +47,11 @@ class NamespaceRegistry:
 
         return [dict(self._entries[key]) for key in sorted(self._entries)]
 
+    def addresses_set(self) -> set[str]:
+        """返回全部已登记地址的集合，供参数校验做资源存在性核对。"""
+
+        return set(self._entries)
+
     def of_kind(self, kind: str) -> list[str]:
         """返回某类型设备的全部地址。"""
 

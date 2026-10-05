@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
@@ -34,6 +35,7 @@ from .rack.mapping import RackMapping
 from .rack.pack import Pack
 from .rack.rack import Rack
 from .soc.soc import SocEstimator
+from .store.index import summarize_documents
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .temp.temp import TempControl
@@ -43,6 +45,29 @@ from .quota.quota import QuotaLedger
 DEFAULT_STATION = "station1"
 DEFAULT_RACK = "rk-01"
 DEFAULT_ZONE = "Z1"
+
+# 读视图只保留最近若干代：页面刷新与接口调用撞在一起时，双方凭同一代版本号
+# 取到的是同一份不可变快照；太久远的版本没有读者，按代际滚动丢弃。
+VIEW_RETENTION = 16
+
+
+class StaleSnapshot(StoreError):
+    """调用方钉住的版本号已经不在保留窗口内，需要重新取最新版本。"""
+
+    def __init__(self, revision: int, latest: int) -> None:
+        super().__init__(
+            f"数据版本 {revision} 已过期（当前为 {latest}），请重新取最新快照",
+            component="console",
+        )
+        self.revision = revision
+        self.latest = latest
+
+    def as_record(self) -> dict:
+        record = super().as_record()
+        record["code"] = "snapshot_stale"
+        record["revision"] = self.revision
+        record["latest"] = self.latest
+        return record
 
 
 def build_rack(rack_id: str, label: str, zone: str, config: StationConfig, packs: int = 8) -> Rack:
@@ -114,9 +139,130 @@ class Platform:
         self._last_audit_ts = 0.0
         self._running = False
         self._lock = threading.RLock()
+        # 只读视图的版本号与近保留窗口。任何改变读数的动作都走 :meth:`_touch`
+        # 推进一代，页面与接口据此核对彼此拿的是不是同一瞬间的数据。
+        self._revision = 0
+        self._views: "OrderedDict[int, dict]" = OrderedDict()
         self._register_namespaces()
         self._restore()
         self.bms.calibration.record(self.config.soc.initial_soc_pct, self.clock.now(), "startup")
+
+    def _touch(self) -> int:
+        """推进读视图一代并让旧版本窗口滚动。必须在变更动作持锁后调用。
+
+        保留窗口按代际距离裁剪：与当前代相差超过 :data:`VIEW_RETENTION` 的旧
+        版本一律丢弃，不管这期间有没有读者构造过视图（没读者时视图根本不生成，
+        按条数裁剪会让旧版本永远不过期）。最新一代视图若已构造则保留，刚读过
+        的页面下一轮刷新大概率还要用。
+        """
+
+        self._revision += 1
+        expired = [revision for revision in self._views if self._revision - revision >= VIEW_RETENTION]
+        for revision in expired:
+            del self._views[revision]
+        return self._revision
+
+    def trend_signals(self) -> set[str]:
+        """返回当前有样本的趋势信号，供接口参数校验使用。"""
+
+        return self.trend.signals()
+
+    def revision(self) -> int:
+        """返回当前读视图版本号。"""
+
+        with self._lock:
+            return self._revision
+
+    def read_view(self, at: int | None = None) -> dict:
+        """取一份覆盖全部读接口的只读视图。
+
+        不带 ``at`` 时构造当前代并缓存；带 ``at`` 时必须返回该代的同一份
+        不可变快照——这就是"页面刷新与接口调用撞在一起也要一致"的保证：
+        先取一次拿到版本号，随后任意数量的读接口都用这个版本号钉住同一份
+        数据。超出保留窗口的旧版本抛 :class:`StaleSnapshot`，调用方重新取
+        最新版本即可。整个构造在平台锁内一次完成，视图字段不再随现场变化。
+        """
+
+        with self._lock:
+            latest = self._revision
+            if at is not None:
+                if at < 0 or at > latest:
+                    raise StaleSnapshot(at, latest)
+                cached = self._views.get(at)
+                if cached is None:
+                    # 版本号合法但快照不在窗口里：要么太旧被淘汰，要么这一代
+                    # 从来没有读者（未被构造过）。两者对调用方都是"拿不到
+                    # 这一代"，统一要求重新取最新版本。
+                    raise StaleSnapshot(at, latest)
+                return cached
+            cached = self._views.get(latest)
+            if cached is not None:
+                return cached
+            view = self._build_view(latest)
+            self._views[latest] = view
+            self._views.move_to_end(latest)
+            return view
+
+    def _build_view(self, revision: int) -> dict:
+        """在平台锁内构造当前代的完整只读视图（每个字段都是新对象）。"""
+
+        journal = self.audit.journal
+        events = [event.as_dict() for event in self.bus.history()]
+        records = self.audit.records(limit=self.audit.memory_limit)
+        store = self.store
+        store_doc = store.read("platform_state") if store.exists("platform_state") else None
+        trend_signals = sorted(self.trend.signals())
+        return {
+            "revision": revision,
+            "generated_at": round(self.clock.now(), 3),
+            "status": self.status(),
+            "capacity": self.capacity().as_dict(),
+            "quota": self.quota_snapshot(),
+            "audit": self.audit_snapshot(),
+            "audit_entries": [record.as_dict() for record in records],
+            "audit_alarms": self.audit.alarms(),
+            "audit_operations": self.audit.operations(limit=20),
+            "audit_report": self.audit.report(),
+            "mapping": self.rack_mapping(),
+            "config": config_to_mapping(self.config),
+            "readiness": self.readiness(),
+            "topology": self.topology_summary(),
+            "namespaces": self.namespaces_describe(),
+            "racks": self.rack_snapshots(),
+            "bms": self.bms_snapshot(),
+            "pcs": self.pcs_snapshot(),
+            "temp": self.temp_snapshot(),
+            "fire": self.fire_snapshot(),
+            "grid": self.grid_snapshot(),
+            "soc": self.soc_snapshot(),
+            "balance": self.balance_snapshot(),
+            "alerts": self.alerts(),
+            "events": events,
+            "event_topics": sorted({event["topic"] for event in events}),
+            "trend": {
+                "period_s": self.trend.period_s,
+                "signals": trend_signals,
+                "series": {
+                    signal: {
+                        "samples": [sample.as_dict() for sample in self.trend.fill_gaps(signal, self.trend.series(signal, 240))],
+                        "mean": self.trend.mean(signal),
+                    }
+                    for signal in trend_signals
+                },
+            },
+            "store": {
+                "root": store.root,
+                "documents": summarize_documents(store),
+                "platform_state_path": store.path_of("platform_state"),
+                "platform_state": store_doc,
+            },
+            "journal": {
+                "topic": journal.topic,
+                "count": journal.count(),
+                "active_segment": journal.active_segment(),
+                "segments": journal.segments(),
+            },
+        }
 
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
@@ -223,22 +369,25 @@ class Platform:
         )
         self._operations += 1
         self._persist()
+        self._touch()
         return summary
 
     def note_error(self, error: StoreError) -> dict:
         """把一次组件异常写进审计，返回落盘记录。"""
 
         payload = error.as_record()
-        self.bus.publish(
-            Event.of(
-                payload["component"],
-                payload["component"],
-                "error",
-                station=self.station,
-                severity="warning",
-                message=payload["message"],
+        with self._lock:
+            self.bus.publish(
+                Event.of(
+                    payload["component"],
+                    payload["component"],
+                    "error",
+                    station=self.station,
+                    severity="warning",
+                    message=payload["message"],
+                )
             )
-        )
+            self._touch()
         return payload
 
     def start(self) -> dict:
@@ -250,6 +399,7 @@ class Platform:
             ready = {name: True for name in self.topology.order()}
             topology = self.topology.verify(set(ready))
             self.bus.publish(Event.of("station", "station", "started", severity="notice", unit=self.station))
+            self._touch()
             return {
                 "running": self._running,
                 "station": self.station,
@@ -268,6 +418,7 @@ class Platform:
             if self.pcs.state_machine.state in ("grid_tie", "off_grid"):
                 self.pcs.transfer("stopped", "platform_stop")
             self.bus.publish(Event.of("station", "station", "stopped", severity="notice", unit=self.station))
+            self._touch()
             return {
                 "running": self._running,
                 "operations": self._operations,
@@ -284,6 +435,7 @@ class Platform:
             self._cycles = 0
             self._drills = 0
             self.store.remove("platform_state")
+            self._touch()
             return previous
 
     def transfer_grid_tie(self, power_kw: float = 120.0, frequency_hz: float = 50.0, dt: float = 1.0) -> dict:
@@ -472,6 +624,7 @@ class Platform:
                     **result,
                 )
             )
+            self._touch()
             return result
 
     def clear_fault(self, rack_id: str | None = None) -> dict:
@@ -481,6 +634,7 @@ class Platform:
             key = rack_id or DEFAULT_RACK
             cleared = self.bms.clear_fault(key)
             self.bus.publish(Event.of("bms", "bms", "fault_clear", station=self.station, severity="notice", rack_id=key))
+            self._touch()
             return {"rack_id": key, "cleared": cleared}
 
     def fire_drill(
@@ -517,13 +671,16 @@ class Platform:
             released = self.fire.reset()
             reset = self.pcs.reset_trip()
             self.bus.publish(Event.of("fire", "fire", "released", station=self.station, severity="notice"))
+            self._touch()
             return {"fire": released, "pcs": reset}
 
     def monitor_frequency(self, frequency_hz: float = 50.0) -> dict:
         """记一次并网点频率采样。"""
 
         with self._lock:
-            return self.grid.monitor_frequency(frequency_hz, self.clock.now())
+            result = self.grid.monitor_frequency(frequency_hz, self.clock.now())
+            self._touch()
+            return result
 
     def set_soc(self, rack_id: str | None = None, soc_pct: float = 50.0) -> dict:
         """直接写入某簇 SOC（现场标定用）。"""
@@ -533,6 +690,7 @@ class Platform:
             bounded = self.config.rack.clamp_soc(soc_pct)
             previous = rack.set_soc(bounded)
             self.soc.report(bounded)
+            self._touch()
             return {"rack_id": rack.rack_id, "previous_pct": round(previous, 3), "soc_pct": round(rack.soc_pct(), 3)}
 
     def disturb_cell(self, rack_id: str | None = None, cell_index: int = 0, delta_v: float = 0.03) -> dict:
@@ -546,6 +704,7 @@ class Platform:
             cell = cells[cell_index]
             cell.update(voltage_v=cell.voltage_v + float(delta_v))
             metrics = rack.metrics()
+            self._touch()
             return {
                 "rack_id": rack.rack_id,
                 "cell_id": cell.cell_id,
@@ -578,6 +737,7 @@ class Platform:
             rolled = self.quota.roll(now)
             self.grid.monitor_frequency(50.0, now)
             self._persist()
+            self._touch()
             return {
                 "cycle": self._cycles,
                 "temperatures": temperatures,
@@ -614,6 +774,8 @@ class Platform:
         for thread in threads:
             thread.join(timeout=30)
         illegal = sorted({state for state in observed if state not in ("grid_tie", "off_grid")})
+        with self._lock:
+            self._touch()
         return {
             "rounds": rounds,
             "samples": len(observed),
@@ -643,6 +805,8 @@ class Platform:
             thread.join(timeout=30)
         coverage = {rack_id: self.bms.faults.counter(rack_id) for rack_id in rack_ids}
         missing = [rack_id for rack_id, count in coverage.items() if count < self.bms.faults.confirm_rounds]
+        with self._lock:
+            self._touch()
         return {
             "rounds": rounds,
             "reports": len(results),
@@ -702,11 +866,6 @@ class Platform:
 
         return [self.racks[rack_id].snapshot().as_dict() for rack_id in sorted(self.racks)]
 
-    def rack_snapshot(self, rack_id: str | None = None) -> dict:
-        """返回单簇快照。"""
-
-        return self._rack(rack_id).snapshot().as_dict()
-
     def rack_mapping(self) -> dict:
         """返回簇编号映射。"""
 
@@ -743,17 +902,13 @@ class Platform:
     def trend_snapshot(self) -> dict:
         return self.trend.snapshot()
 
-    def config_export(self) -> dict:
-        """返回生效配置，供控制台与交付自检核对。"""
-
-        return config_to_mapping(self.config)
-
     def status(self) -> dict:
         """返回平台总状态。"""
 
         return {
             "station": self.station,
             "running": self._running,
+            "revision": self._revision,
             "operations": self._operations,
             "cycles": self._cycles,
             "faults_reported": self._faults_reported,
@@ -769,16 +924,23 @@ class Platform:
             "balance": self.balance_snapshot(),
         }
 
-    def snapshot(self) -> dict:
-        """返回平台完整快照（状态 + 容量 + 配额 + 审计）。"""
+    def snapshot(self, at: int | None = None) -> dict:
+        """返回平台完整快照（状态 + 容量 + 配额 + 审计）。
 
+        与控制台读接口同源于 :meth:`read_view`，保证页面、接口和命令行拿到的
+        快照口径一致；``at`` 非空时钉住指定数据版本。
+        """
+
+        view = self.read_view(at)
         return {
-            "status": self.status(),
-            "capacity": self.capacity().as_dict(),
-            "quota": self.quota_snapshot(),
-            "audit": self.audit_snapshot(),
-            "mapping": self.rack_mapping(),
-            "config": config_to_mapping(self.config),
+            "revision": view["revision"],
+            "generated_at": view["generated_at"],
+            "status": view["status"],
+            "capacity": view["capacity"],
+            "quota": view["quota"],
+            "audit": view["audit"],
+            "mapping": view["mapping"],
+            "config": view["config"],
         }
 
 

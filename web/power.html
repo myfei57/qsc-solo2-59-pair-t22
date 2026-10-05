@@ -9,6 +9,7 @@
     th, td { border: 1px solid #d6dde6; padding: 6px 10px; text-align: left; }
     th { background: #eef3f9; }
     pre { background: #f7f9fc; padding: 10px; overflow-x: auto; }
+    .rev { color: #5b6775; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -19,9 +20,14 @@
   <table><tbody id="quota"></tbody></table>
   <h2>趋势</h2>
   <pre id="trend"></pre>
+  <p class="rev" id="revision"></p>
+  <script src="console.js"></script>
   <script>
-    async function load() {
-      const grid = await (await fetch("/api/grid")).json();
+    const SIGNAL = "rk-01.voltage";
+    // 并网点、配额、趋势三段同属一代快照；趋势信号不存在时按无数据展示，
+    // 不会再和上面两块各拉一次接口而落到不同瞬间。
+    ConsoleData.startPolling((view) => {
+      const grid = view.grid;
       const flow = grid.flow;
       document.getElementById("grid").innerHTML = [
         ["上网限额(kW)", grid.limit.export_limit_kw],
@@ -32,7 +38,7 @@
         ["频率", grid.frequency.last ? grid.frequency.last.frequency_hz : "无"],
       ].map(([key, value]) => `<tr><th>${key}</th><td>${value}</td></tr>`).join("");
 
-      const quota = await (await fetch("/api/quota")).json();
+      const quota = view.quota;
       document.getElementById("quota").innerHTML = [
         ["周期", quota.period],
         ["滚动次数", quota.rolls],
@@ -43,13 +49,14 @@
         ["本周期收益", quota.settlement.margin],
       ].map(([key, value]) => `<tr><th>${key}</th><td>${value}</td></tr>`).join("");
 
-      const trend = await (await fetch("/api/trend?signal=rk-01.voltage")).json();
+      const trend = (view.trend.series[SIGNAL] && view.trend.series[SIGNAL].samples) || [];
       document.getElementById("trend").textContent =
-        `信号 ${trend.signal}｜周期 ${trend.period_s}s｜均值 ${trend.mean}\n` +
-        trend.samples.map((point) => `${point.ts}  ${point.value}`).join("\n");
-    }
-    load();
-    setInterval(load, 5000);
+        `信号 ${SIGNAL}｜周期 ${view.trend.period_s}s\n` +
+        (trend.length
+          ? trend.map((point) => `${point.ts}  ${point.value}`).join("\n")
+          : "暂无样本");
+      document.getElementById("revision").textContent = "数据版本 " + view.revision;
+    });
   </script>
 </body>
 </html>

@@ -35,6 +35,11 @@ class FireLinkage:
     def detectors(self) -> ZoneDetectors:
         return self._detectors
 
+    def zones(self) -> list[str]:
+        """返回全部消防分区名，供参数校验做资源存在性核对。"""
+
+        return self._detectors.zones()
+
     @property
     def valve(self) -> SuppressionValve:
         return self._valve

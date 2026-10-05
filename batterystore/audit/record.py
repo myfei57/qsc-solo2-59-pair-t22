@@ -61,7 +61,7 @@ class AuditRecord:
             "action": self.action,
             "severity": self.severity,
             "message": self.message,
-            "payload": self.payload,
+            "payload": dict(self.payload),
         }
 
     def is_alarm(self) -> bool:

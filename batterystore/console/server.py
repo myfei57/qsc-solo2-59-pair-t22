@@ -36,15 +36,42 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
-        try:
-            body = json.loads(raw.decode("utf-8")) if raw else {}
-        except json.JSONDecodeError:
-            body = {}
-        if not isinstance(body, dict):
+        body: dict | None
+        if raw:
+            try:
+                decoded = json.loads(raw.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._send_json(
+                    400,
+                    {
+                        "error": "bad_request",
+                        "code": "invalid_json",
+                        "component": "console",
+                        "message": "请求体必须是合法的 JSON 对象",
+                    },
+                )
+                return
+            if not isinstance(decoded, dict):
+                self._send_json(
+                    400,
+                    {
+                        "error": "bad_request",
+                        "code": "invalid_json",
+                        "component": "console",
+                        "message": "请求体必须是 JSON 对象",
+                    },
+                )
+                return
+            body = decoded
+        else:
             body = {}
         page = self.server.pages.resolve(parsed.path)  # type: ignore[attr-defined]
         if method == "GET" and page is not None:
             self._send_html(self.server.pages.render(page))  # type: ignore[attr-defined]
+            return
+        asset = self.server.pages.resolve_asset(parsed.path)  # type: ignore[attr-defined]
+        if method == "GET" and asset is not None:
+            self._send_asset(self.server.pages.render_asset(asset), asset)  # type: ignore[attr-defined]
             return
         query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
         status, payload = self.server.api.handle(method, parsed.path, query, body)  # type: ignore[attr-defined]
@@ -62,6 +89,14 @@ class _Handler(BaseHTTPRequestHandler):
         data = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_asset(self, data: bytes, name: str) -> None:
+        content_type = "application/javascript; charset=utf-8" if name.endswith(".js") else "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)

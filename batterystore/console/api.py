@@ -1,33 +1,28 @@
 """控制台接口处理器。
 
-每个接口都是对平台公开方法的一次调用；动作类接口把请求体里的参数透传给
-平台，缺少必填字段时返回 ``400``，平台异常统一转成 ``409`` 并在响应里带上
-组件名。页面清单与键值清单也在这里暴露，便于交付自检核对接口齐全。
+处理器不再各写一套参数解析：每条接口在 :mod:`batterystore.console.manifest`
+里声明方法、路径、参数规格与处理器名，启动时双向自检（清单 ↔ 路由表 ↔
+处理器方法），新增接口忘了登记会直接启动失败。
+
+读接口（GET）一律从平台 :meth:`Platform.read_view` 返回的同一份不可变快照里
+投影，支持 ``at=<revision>`` 钉版本；写接口（POST）调用平台动作并把最新版本号
+随响应返回。错误口径只有两种，前端按状态码分流：
+
+* ``400``：请求本身错（参数类型、取值、枚举、资源引用、多余字段、非法 JSON），
+  响应体 ``{"error": "bad_request", "code": ..., "field": ..., "message": ...}``，
+  不写审计——这是调用方的问题，改请求再发即可；
+* ``409``：请求合法但现场状态拒绝（联锁、配额、消防、持久化），或钉住的快照
+  版本已过期，响应体保留原异常类型与组件，同时写审计留痕。
 """
 
 from __future__ import annotations
 
-from ..audit.timeline import build_timeline
 from ..errors import StoreError
-from ..store.index import summarize_documents
+from ..app import StaleSnapshot
+from .manifest import SPECS, Spec
 from .pages import PageLibrary
+from .params import BadRequest, validate
 from .router import Router
-
-
-def _as_float(body: dict, key: str, default: float) -> float:
-    value = body.get(key, default)
-    try:
-        return float(value)
-    except (TypeError, ValueError) as error:
-        raise StoreError(f"参数 {key!r} 必须是数值", component="console") from error
-
-
-def _as_int(body: dict, key: str, default: int) -> int:
-    value = body.get(key, default)
-    try:
-        return int(value)
-    except (TypeError, ValueError) as error:
-        raise StoreError(f"参数 {key!r} 必须是整数", component="console") from error
 
 
 class Api:
@@ -37,7 +32,9 @@ class Api:
         self._platform = platform
         self._pages = pages
         self._router = Router()
+        self._specs: dict[tuple[str, str], Spec] = {}
         self._register()
+        self.self_check()
 
     @property
     def platform(self):
@@ -48,216 +45,300 @@ class Api:
         return self._pages
 
     def _register(self) -> None:
-        add = self._router.add
-        add("GET", "/api/status", lambda params, body: self._platform.status())
-        add("GET", "/api/snapshot", lambda params, body: self._platform.snapshot())
-        add("GET", "/api/readiness", lambda params, body: self._platform.readiness())
-        add("GET", "/api/topology", lambda params, body: self._platform.topology_summary())
-        add("GET", "/api/namespaces", lambda params, body: {"devices": self._platform.namespaces_describe()})
-        add("GET", "/api/namespace/{address}", lambda params, body: self._platform.namespace(str(params.get("address", ""))))
-        add("GET", "/api/capacity", lambda params, body: self._platform.capacity().as_dict())
-        add("GET", "/api/racks", lambda params, body: {"racks": self._platform.rack_snapshots()})
-        add("GET", "/api/rack/{rack_id}", lambda params, body: self._platform.rack_snapshot(str(params.get("rack_id", ""))))
-        add("GET", "/api/mapping", lambda params, body: self._platform.rack_mapping())
-        add("GET", "/api/bms", lambda params, body: self._platform.bms_snapshot())
-        add("GET", "/api/pcs", lambda params, body: self._platform.pcs_snapshot())
-        add("GET", "/api/temp", lambda params, body: self._platform.temp_snapshot())
-        add("GET", "/api/fire", lambda params, body: self._platform.fire_snapshot())
-        add("GET", "/api/grid", lambda params, body: self._platform.grid_snapshot())
-        add("GET", "/api/soc", lambda params, body: self._platform.soc_snapshot())
-        add("GET", "/api/balance", lambda params, body: self._platform.balance_snapshot())
-        add("GET", "/api/quota", lambda params, body: self._platform.quota_snapshot())
-        add("GET", "/api/audit", self._audit)
-        add("GET", "/api/audit/report", lambda params, body: self._platform.audit.report())
-        add("GET", "/api/audit/operations", self._operations)
-        add("GET", "/api/alarms", lambda params, body: {"alarms": self._platform.audit.alarms()})
-        add("GET", "/api/alerts", lambda params, body: {"alerts": self._platform.alerts()})
-        add("GET", "/api/events", self._events)
-        add("GET", "/api/trend", self._trend)
-        add("GET", "/api/store", self._store)
-        add("GET", "/api/timeline", self._timeline)
-        add("GET", "/api/journal", self._journal)
-        add("GET", "/api/config", lambda params, body: self._platform.config_export())
-        add("GET", "/api/pages", lambda params, body: {"pages": self._pages.index(), "routes": self.routes()})
-        add("POST", "/api/start", lambda params, body: self._platform.start())
-        add("POST", "/api/stop", lambda params, body: self._platform.stop())
-        add("POST", "/api/reset", lambda params, body: self._platform.reset_state())
-        add("POST", "/api/step", self._cycle)
-        add("POST", "/api/transfer", self._transfer)
-        add("POST", "/api/off-grid", lambda params, body: self._platform.transfer_off_grid())
-        add("POST", "/api/discharge", self._discharge)
-        add("POST", "/api/charge", self._charge)
-        add("POST", "/api/balance", self._balance)
-        add("POST", "/api/temperature", self._temperature)
-        add("POST", "/api/replace-pack", self._replace_pack)
-        add("POST", "/api/calibrate", self._calibrate)
-        add("POST", "/api/fault", self._fault)
-        add("POST", "/api/fault/clear", self._fault_clear)
-        add("POST", "/api/fire/drill", self._drill)
-        add("POST", "/api/fire/release", lambda params, body: self._platform.release_fire())
-        add("POST", "/api/frequency", self._frequency)
-        add("POST", "/api/soc", self._soc)
-        add("POST", "/api/disturb", self._disturb)
-        add("POST", "/api/probe/pcs", self._probe_pcs)
-        add("POST", "/api/probe/fault", self._probe_fault)
+        """按接口清单登记路由；清单是接口存在性的唯一出处。"""
+
+        for spec in SPECS:
+            key = (spec.method, spec.path)
+            if key in self._specs:
+                raise RuntimeError(f"接口清单里存在重复登记: {spec.method} {spec.path}")
+            self._specs[key] = spec
+            self._router.add(spec.method, spec.path, spec)
+
+    def self_check(self) -> None:
+        """启动自检：清单、路由表与处理器方法必须一一对应。
+
+        任何一边对不上都直接抛错终止启动，而不是等到请求打过来才发现：
+        清单多了处理器没实现、有人绕过清单直接加路由、路径或方法拼错，
+        都属于"接线没接完"，不允许带上线。
+        """
+
+        problems: list[str] = []
+        for spec in SPECS:
+            handler = getattr(self, spec.handler, None)
+            if not callable(handler):
+                problems.append(f"清单声明的处理器 {spec.handler} 在 Api 上不存在（{spec.method} {spec.path}）")
+            if self._router.match(spec.method, self._pattern_sample(spec.path)) is None:
+                problems.append(f"清单声明的路由未进路由表: {spec.method} {spec.path}")
+        routed = {(route.method, route.pattern) for route in self._router.routes()}
+        declared = set(self._specs)
+        for method, path in sorted(routed - declared):
+            problems.append(f"路由表存在未登记接口: {method} {path}（新增接口必须进接口清单）")
+        if problems:
+            raise RuntimeError("控制台接口自检失败：\n  - " + "\n  - ".join(problems))
+
+    @staticmethod
+    def _pattern_sample(path: str) -> str:
+        """给带参路径造一个能命中路由的样例路径。"""
+
+        return "/".join("seg" if segment.startswith("{") and segment.endswith("}") else segment
+                        for segment in path.split("/"))
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
 
-        return [route.as_dict() for route in self._router.routes()]
+        return [spec.as_dict() for spec in SPECS]
 
     def handle(self, method: str, path: str, query: dict, body: dict) -> tuple[int, dict]:
         """处理一次请求，返回状态码与响应体。"""
 
         matched = self._router.match(method, path)
         if matched is None:
-            return 404, {"error": "not_found", "path": path}
-        handler, params = matched
-        merged = {**query, **params}
+            return 404, {"error": "not_found", "code": "not_found", "path": path}
+        spec, path_params = matched
         try:
-            payload = handler(merged, body)
+            params = validate(self._platform, spec.params, query, body, path_params)
+            view = None
+            if method == "GET" and spec.path != "/api/pages":
+                view = self._platform.read_view(params.get("at"))
+            payload = getattr(self, spec.handler)(params, body, view)
+        except BadRequest as error:
+            return 400, {"error": "bad_request", **error.as_record()}
+        except StaleSnapshot as error:
+            return 409, {"error": type(error).__name__, **error.as_record()}
         except StoreError as error:
             # 控制台拒绝的动作也要留痕，便于巡检区分"谁触发了哪条联锁"。
             self._platform.note_error(error)
             return 409, {"error": type(error).__name__, **error.as_record()}
+        except (KeyError, IndexError) as error:
+            # 防御层：资源上界理论上已在参数校验里拦住，落到这里说明校验漏了，
+            # 统一归成请求错误而不是裸 500，前端仍按 400 路径处理。
+            bad = BadRequest(str(error), code="unknown_resource")
+            return 400, {"error": "bad_request", **bad.as_record()}
+        if spec.write:
+            payload = {"revision": self._platform.revision(), **payload}
         return 200, payload
 
-    def _audit(self, params: dict, body: dict) -> dict:
+    # ------------------------------------------------------------------
+    # 只读处理器：全部从同一份 read_view 投影，页面与接口因此同源同版本。
+    # ------------------------------------------------------------------
+
+    def h_view(self, params: dict, body: dict, view: dict) -> dict:
+        return view
+
+    def h_status(self, params: dict, body: dict, view: dict) -> dict:
+        return view["status"]
+
+    def h_snapshot(self, params: dict, body: dict, view: dict) -> dict:
         return {
-            "entries": self._platform.audit.query(
-                component=params.get("component"),
-                severity=params.get("severity"),
-                action=params.get("action"),
-                limit=int(params.get("limit", 100)),
-            )
+            "revision": view["revision"],
+            "generated_at": view["generated_at"],
+            "status": view["status"],
+            "capacity": view["capacity"],
+            "quota": view["quota"],
+            "audit": view["audit"],
+            "mapping": view["mapping"],
+            "config": view["config"],
         }
 
-    def _operations(self, params: dict, body: dict) -> dict:
-        return {"operations": self._platform.audit.operations(limit=int(params.get("limit", 20)))}
+    def h_readiness(self, params: dict, body: dict, view: dict) -> dict:
+        return view["readiness"]
 
-    def _events(self, params: dict, body: dict) -> dict:
-        topic = params.get("topic")
-        return {"events": [event.as_dict() for event in self._platform.bus.history(topic)]}
+    def h_topology(self, params: dict, body: dict, view: dict) -> dict:
+        return view["topology"]
 
-    def _trend(self, params: dict, body: dict) -> dict:
-        signal = params.get("signal", "rk-01.temperature")
-        samples = self._platform.trend.series(signal, limit=int(params.get("limit", 60)))
-        filled = self._platform.trend.fill_gaps(signal, samples)
+    def h_namespaces(self, params: dict, body: dict, view: dict) -> dict:
+        return {"devices": view["namespaces"]}
+
+    def h_namespace(self, params: dict, body: dict, view: dict) -> dict:
+        return next(item for item in view["namespaces"] if item["address"] == params["address"])
+
+    def h_capacity(self, params: dict, body: dict, view: dict) -> dict:
+        return view["capacity"]
+
+    def h_racks(self, params: dict, body: dict, view: dict) -> dict:
+        return {"racks": view["racks"], "revision": view["revision"]}
+
+    def h_rack(self, params: dict, body: dict, view: dict) -> dict:
+        return next(rack for rack in view["racks"] if rack["rack_id"] == params["rack_id"])
+
+    def h_mapping(self, params: dict, body: dict, view: dict) -> dict:
+        return view["mapping"]
+
+    def h_bms(self, params: dict, body: dict, view: dict) -> dict:
+        return view["bms"]
+
+    def h_pcs(self, params: dict, body: dict, view: dict) -> dict:
+        return view["pcs"]
+
+    def h_temp(self, params: dict, body: dict, view: dict) -> dict:
+        return view["temp"]
+
+    def h_fire(self, params: dict, body: dict, view: dict) -> dict:
+        return view["fire"]
+
+    def h_grid(self, params: dict, body: dict, view: dict) -> dict:
+        return view["grid"]
+
+    def h_soc(self, params: dict, body: dict, view: dict) -> dict:
+        return view["soc"]
+
+    def h_balance(self, params: dict, body: dict, view: dict) -> dict:
+        return view["balance"]
+
+    def h_quota(self, params: dict, body: dict, view: dict) -> dict:
+        return view["quota"]
+
+    def h_audit(self, params: dict, body: dict, view: dict) -> dict:
+        entries = [
+            entry
+            for entry in view["audit_entries"]
+            if (params["component"] is None or entry["component"] == params["component"])
+            and (params["severity"] is None or entry["severity"] == params["severity"])
+            and (params["action"] is None or entry["action"] == params["action"])
+        ]
+        entries = list(reversed(entries[-params["limit"]:]))
+        return {"entries": entries, "revision": view["revision"]}
+
+    def h_audit_report(self, params: dict, body: dict, view: dict) -> dict:
+        return view["audit_report"]
+
+    def h_audit_operations(self, params: dict, body: dict, view: dict) -> dict:
+        return {"operations": view["audit_operations"][: params["limit"]]}
+
+    def h_alarms(self, params: dict, body: dict, view: dict) -> dict:
+        return {"alarms": view["audit_alarms"], "revision": view["revision"]}
+
+    def h_alerts(self, params: dict, body: dict, view: dict) -> dict:
+        return {"alerts": view["alerts"], "revision": view["revision"]}
+
+    def h_events(self, params: dict, body: dict, view: dict) -> dict:
+        topic = params["topic"]
+        events = view["events"] if topic is None else [event for event in view["events"] if event["topic"] == topic]
+        return {"events": events, "topics": view["event_topics"], "revision": view["revision"]}
+
+    def h_trend(self, params: dict, body: dict, view: dict) -> dict:
+        signal = params["signal"]
+        data = view["trend"]["series"][signal]
         return {
             "signal": signal,
-            "period_s": self._platform.trend.period_s,
-            "mean": self._platform.trend.mean(signal),
-            "samples": [sample.as_dict() for sample in filled],
+            "period_s": view["trend"]["period_s"],
+            "mean": data["mean"],
+            "samples": data["samples"][-params["limit"]:],
+            "revision": view["revision"],
         }
 
-    def _store(self, params: dict, body: dict) -> dict:
-        store = self._platform.store
-        return {
-            "root": store.root,
-            "documents": summarize_documents(store),
-            "platform_state_path": store.path_of("platform_state"),
-            "platform_state": store.read("platform_state"),
-        }
+    def h_store(self, params: dict, body: dict, view: dict) -> dict:
+        return view["store"]
 
-    def _timeline(self, params: dict, body: dict) -> dict:
-        records = self._platform.audit.records(limit=int(params.get("limit", 200)))
-        return {"timeline": build_timeline(records, station=params.get("station"))}
+    def h_timeline(self, params: dict, body: dict, view: dict) -> dict:
+        station = params["station"]
+        entries = view["audit_entries"]
+        if station is not None:
+            entries = [entry for entry in entries if entry["station"] == station]
+        timeline = [
+            {
+                "ts": entry["ts"],
+                "component": entry["component"],
+                "action": entry["action"],
+                "severity": entry["severity"],
+                "message": entry["message"],
+                "op_id": entry["payload"].get("op_id", ""),
+            }
+            for entry in entries
+        ]
+        return {"timeline": timeline[-params["limit"]:], "revision": view["revision"]}
 
-    def _journal(self, params: dict, body: dict) -> dict:
-        journal = self._platform.audit.journal
-        payload: dict = {
-            "topic": journal.topic,
-            "count": journal.count(),
-            "active_segment": journal.active_segment(),
-            "segments": journal.segments(),
-        }
-        segment = params.get("segment")
+    def h_journal(self, params: dict, body: dict, view: dict) -> dict:
+        payload = dict(view["journal"])
+        segment = params["segment"]
         if segment is not None:
-            payload["records"] = self._platform.audit.replay_segment(int(segment))
+            payload["records"] = self._platform.audit.replay_segment(segment)
         return payload
 
-    def _cycle(self, params: dict, body: dict) -> dict:
-        return self._platform.cycle(dt=_as_float(body, "dt", 5.0))
+    def h_config(self, params: dict, body: dict, view: dict) -> dict:
+        return view["config"]
 
-    def _transfer(self, params: dict, body: dict) -> dict:
+    def h_pages(self, params: dict, body: dict, view: dict | None) -> dict:
+        return {"pages": self._pages.index(), "routes": self.routes()}
+
+    # ------------------------------------------------------------------
+    # 写处理器：直接透传清单校验后的参数，平台侧只处理业务规则。
+    # ------------------------------------------------------------------
+
+    def h_start(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.start()
+
+    def h_stop(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.stop()
+
+    def h_reset(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.reset_state()
+
+    def h_step(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.cycle(dt=params["dt"])
+
+    def h_transfer(self, params: dict, body: dict, view: dict | None) -> dict:
         return self._platform.transfer_grid_tie(
-            power_kw=_as_float(body, "power_kw", 120.0),
-            frequency_hz=_as_float(body, "frequency_hz", 50.0),
-            dt=_as_float(body, "dt", 1.0),
+            power_kw=params["power_kw"], frequency_hz=params["frequency_hz"], dt=params["dt"]
         )
 
-    def _discharge(self, params: dict, body: dict) -> dict:
-        return self._platform.discharge(
-            power_kw=_as_float(body, "power_kw", 200.0),
-            dt=_as_float(body, "dt", 60.0),
-        )
+    def h_off_grid(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.transfer_off_grid()
 
-    def _charge(self, params: dict, body: dict) -> dict:
-        return self._platform.charge(
-            rack_id=body.get("rack_id"),
-            steps=_as_int(body, "steps", 3),
-            dt=_as_float(body, "dt", 60.0),
-        )
+    def h_discharge(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.discharge(power_kw=params["power_kw"], dt=params["dt"])
 
-    def _balance(self, params: dict, body: dict) -> dict:
+    def h_charge(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.charge(rack_id=params["rack_id"], steps=params["steps"], dt=params["dt"])
+
+    def h_balance_post(self, params: dict, body: dict, view: dict | None) -> dict:
         return self._platform.balance(
-            rack_id=body.get("rack_id"),
-            dt=_as_float(body, "dt", 2.0),
-            max_steps=_as_int(body, "max_steps", 400),
+            rack_id=params["rack_id"], dt=params["dt"], max_steps=params["max_steps"]
         )
 
-    def _temperature(self, params: dict, body: dict) -> dict:
+    def h_temperature(self, params: dict, body: dict, view: dict | None) -> dict:
         return self._platform.sample_temperature(
-            rack_id=body.get("rack_id"),
-            temperature_c=_as_float(body, "temperature_c", 30.0),
-            dt=_as_float(body, "dt", 5.0),
+            rack_id=params["rack_id"], temperature_c=params["temperature_c"], dt=params["dt"]
         )
 
-    def _replace_pack(self, params: dict, body: dict) -> dict:
+    def h_replace_pack(self, params: dict, body: dict, view: dict | None) -> dict:
         return self._platform.replace_pack_rating(
-            pack_index=_as_int(body, "pack_index", 0),
-            rating_v=_as_float(body, "rating_v", 3.35),
-            rack_id=body.get("rack_id"),
+            pack_index=params["pack_index"], rating_v=params["rating_v"], rack_id=params["rack_id"]
         )
 
-    def _calibrate(self, params: dict, body: dict) -> dict:
-        return self._platform.calibrate_soc(
-            soc_pct=_as_float(body, "soc_pct", 50.0),
-            source=str(body.get("source", "console")),
-        )
+    def h_calibrate(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.calibrate_soc(soc_pct=params["soc_pct"], source=params["source"])
 
-    def _fault(self, params: dict, body: dict) -> dict:
-        return self._platform.report_fault(
-            rack_id=body.get("rack_id"),
-            code=str(body.get("code", "bms_fault")),
-        )
+    def h_fault(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.report_fault(rack_id=params["rack_id"], code=params["code"])
 
-    def _fault_clear(self, params: dict, body: dict) -> dict:
-        return self._platform.clear_fault(rack_id=body.get("rack_id"))
+    def h_fault_clear(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.clear_fault(rack_id=params["rack_id"])
 
-    def _drill(self, params: dict, body: dict) -> dict:
+    def h_drill(self, params: dict, body: dict, view: dict | None) -> dict:
         return self._platform.fire_drill(
-            zone=str(body.get("zone", "Z1")),
-            smoke_ppm=_as_float(body, "smoke_ppm", 1500.0),
-            temperature_c=_as_float(body, "temperature_c", 30.0),
-            confirm_dt=_as_float(body, "confirm_dt", 5.0),
+            zone=params["zone"],
+            smoke_ppm=params["smoke_ppm"],
+            temperature_c=params["temperature_c"],
+            confirm_dt=params["confirm_dt"],
         )
 
-    def _frequency(self, params: dict, body: dict) -> dict:
-        return self._platform.monitor_frequency(frequency_hz=_as_float(body, "frequency_hz", 50.0))
+    def h_fire_release(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.release_fire()
 
-    def _soc(self, params: dict, body: dict) -> dict:
-        return self._platform.set_soc(rack_id=body.get("rack_id"), soc_pct=_as_float(body, "soc_pct", 50.0))
+    def h_frequency(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.monitor_frequency(frequency_hz=params["frequency_hz"])
 
-    def _disturb(self, params: dict, body: dict) -> dict:
+    def h_set_soc(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.set_soc(rack_id=params["rack_id"], soc_pct=params["soc_pct"])
+
+    def h_disturb(self, params: dict, body: dict, view: dict | None) -> dict:
         return self._platform.disturb_cell(
-            rack_id=body.get("rack_id"),
-            cell_index=_as_int(body, "cell_index", 0),
-            delta_v=_as_float(body, "delta_v", 0.03),
+            rack_id=params["rack_id"], cell_index=params["cell_index"], delta_v=params["delta_v"]
         )
 
-    def _probe_pcs(self, params: dict, body: dict) -> dict:
-        return self._platform.concurrency_probe(rounds=_as_int(body, "rounds", 32))
+    def h_probe_pcs(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.concurrency_probe(rounds=params["rounds"])
 
-    def _probe_fault(self, params: dict, body: dict) -> dict:
-        return self._platform.concurrency_fault_probe(rounds=_as_int(body, "rounds", 16))
+    def h_probe_fault(self, params: dict, body: dict, view: dict | None) -> dict:
+        return self._platform.concurrency_fault_probe(rounds=params["rounds"])
